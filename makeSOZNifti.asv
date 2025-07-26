@@ -1,0 +1,139 @@
+%%========================================================================
+% Script:     ProjectSurfaceHeatmapToNifti.m
+% Purpose:    Load a surface‐based heatmap (.fig), convert vertex intensities 
+%             to voxel space, write unsmoothed and smoothed NIfTI volumes, 
+%             and display central orthogonal slices.
+%
+% Author:     
+% Created:    2025‑07‑26
+% Last Edit:  2025‑07‑26
+%
+% Inputs:
+%   figFile      - Path to saved heatmap .fig file
+%   t1File       - Path to template anatomical NIfTI (.nii)
+%   x_offset_mm  - Manual R/L translation (mm)
+%   y_offset_mm  - Manual A/P translation (mm)
+%   z_offset_mm  - Manual S/I translation (mm)
+%
+% Outputs:
+%   heatmap_nosmooth.nii   - Float32 NIfTI of raw projected heatmap
+%   heatmap_smooth.nii     - Float32 NIfTI after 3D Gaussian smoothing
+%   Figures showing sagittal, coronal, axial slices of the smoothed map
+%
+% Workflow:
+%   1. Extract vertices & color data from .fig
+%   2. Map to voxel indices using SPM’s affine
+%   3. Write and verify unsmoothed volume
+%   4. Smooth in MATLAB; write and verify smoothed volume
+%   5. Display central slices
+%
+% Requirements:
+%   • MATLAB with SPM12 on path
+%   • Image Processing Toolbox for imgaussfilt3
+%
+%%========================================================================
+
+
+
+%% USER SETTINGS — adjust these three
+figFile  = 'SOZHeatmap020.fig';     % your saved heatmap figure
+t1File   = '/Users/neurallabpostgrads/Desktop/Resection_masks/Subject_020/preop_aligned2_020.nii';     % your template anatomical NIfTI
+
+%% 0. Extract surface data from the .fig
+fig = openfig(figFile,'invisible');
+h   = findobj(fig,'Type','patch');
+vertex_pial    = h.Vertices;           % [nVerts×3]
+vertex_colors  = h.FaceVertexCData;    % [nVerts×3]
+cmap           = colormap(fig);        
+nC             = size(cmap,1);
+vertex_density = zeros(size(vertex_colors,1),1);
+for ii=1:size(vertex_colors,1)
+    [~,idx] = min(sum((cmap - vertex_colors(ii,:)).^2,2));
+    vertex_density(ii) = (idx-1)/(nC-1);
+end
+close(fig);
+
+%% 1. Prep SPM
+spmPath = 'Toolboxes/spm12-master';    % folder containing spm12.m
+addpath(spmPath);
+spm('defaults','fmri');
+spm_jobman('initcfg');
+
+%% 2. Load template & force float32 output
+V       = spm_vol(t1File);     
+V.dt    = [16 0];              % <<<<< force float32
+dim     = V.dim;               
+affine  = V.mat;               
+outVol  = zeros(dim);
+
+%% 2.5. MANUAL TRANSLATION (Visual Workaround)
+% Adjust these values in millimeters to move the heatmap.
+% +x is Right, +y is Anterior, +z is Superior
+x_offset_mm = 0;   
+y_offset_mm = 0;  
+z_offset_mm = 0;  % <-- START BY ADJUSTING THIS TO MOVE IT "UP"
+
+fprintf('Applying manual offset (R/L: %dmm, A/P: %dmm, S/I: %dmm)\n', ...
+        x_offset_mm, y_offset_mm, z_offset_mm);
+
+% Apply the translation to the vertex coordinates
+vertex_pial(:,1) = vertex_pial(:,1) + x_offset_mm;
+vertex_pial(:,2) = vertex_pial(:,2) + y_offset_mm;
+vertex_pial(:,3) = vertex_pial(:,3) + z_offset_mm; 
+
+
+%% 3. Project vertices → voxels
+nVert   = size(vertex_pial,1);
+RAS_hom = [vertex_pial'; ones(1,nVert)];
+VOX_hom = affine \ RAS_hom;
+i       = round(VOX_hom(1,:)); j = round(VOX_hom(2,:)); k = round(VOX_hom(3,:));
+valid   = i>=1 & i<=dim(1) & j>=1 & j<=dim(2) & k>=1 & k<=dim(3);
+inds    = sub2ind(dim,i(valid),j(valid),k(valid));
+
+fprintf('Mapping → nonzero voxels in outVol: %d / %d (%.2f%%)\n', ...
+        nnz(outVol), numel(outVol),100*nnz(outVol)/numel(outVol));
+outVol(inds) = vertex_density(valid);
+
+%% 4. Write unsmoothed float32 NIfTI & verify
+V.fname = 'heatmap_nosmooth.nii';
+spm_write_vol(V,outVol);
+
+W  = spm_vol('heatmap_nosmooth.nii');
+Y2 = spm_read_vols(W);
+fprintf('Reload check → nonzero voxels: %d / %d (%.2f%%)\n\n', ...
+        nnz(Y2), numel(Y2),100*nnz(Y2)/numel(Y2));
+
+%% 5. Smooth in MATLAB and write as float32
+voxelSizes   = sqrt(sum(affine(1:3,1:3).^2,1));  
+fwhm_mm      = [5 5 5];
+sigma_mm     = fwhm_mm/(2*sqrt(2*log(2)));
+sigma_vox    = sigma_mm ./ voxelSizes;
+smoothedVol  = imgaussfilt3(outVol, sigma_vox,'Padding','replicate');
+
+Vs       = V;
+Vs.fname = 'heatmap_smooth.nii';
+Vs.dt    = [16 0];              % <<<<< ensure float32 here too
+spm_write_vol(Vs, smoothedVol);
+
+U  = spm_vol('heatmap_smooth.nii');
+Z2 = spm_read_vols(U);
+fprintf('Smoothed reload → nonzero voxels: %d / %d (%.2f%%)\n\n', ...
+        nnz(Z2), numel(Z2),100*nnz(Z2)/numel(Z2));
+
+%% 6. Show central slices of the smoothed heatmap
+midX = round(dim(1)/2);
+midY = round(dim(2)/2);
+midZ = round(dim(3)/2);
+
+figure;
+subplot(1,3,1);
+imagesc(squeeze(Z2(midX,:,:))'); axis equal tight off;
+title('Sagittal');   colormap(jet); colorbar;
+
+subplot(1,3,2);
+imagesc(squeeze(Z2(:,midY,:))'); axis equal tight off;
+title('Coronal');    colormap(jet); colorbar;
+
+subplot(1,3,3);
+imagesc(Z2(:,:,midZ));        axis equal tight off;
+title('Axial');      colormap(jet); colorbar;
